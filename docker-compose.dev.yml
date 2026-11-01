@@ -1,0 +1,9 @@
+services:
+  app:
+    build:
+      context: .
+      dockerfile: deploy/docker/app.Dockerfile
+  web:
+    build:
+      context: .
+      dockerfile: deploy/docker/web.Dockerfile

@@ -1,0 +1,28 @@
+# syntax=docker/dockerfile:1
+
+FROM --platform=$BUILDPLATFORM golang:1.25-alpine AS builder
+ARG TARGETOS
+ARG TARGETARCH
+
+WORKDIR /src
+COPY app/go.mod app/go.sum* ./app/
+WORKDIR /src/app
+ENV CGO_ENABLED=0
+RUN apk add --no-cache ca-certificates tzdata
+RUN --mount=type=cache,target=/go/pkg/mod \
+    go mod download
+
+COPY app/ /src/app/
+RUN --mount=type=cache,target=/root/.cache/go-build \
+    GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build -trimpath -ldflags="-s -w" -o /out/tgtldr ./cmd/server
+
+FROM alpine:3.22
+RUN addgroup -S -g 10001 app && adduser -S -D -u 10001 -G app app && mkdir -p /var/lib/tgtldr && chown -R app:app /var/lib/tgtldr
+WORKDIR /app
+COPY --from=builder /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/
+COPY --from=builder /usr/share/zoneinfo /usr/share/zoneinfo
+COPY --from=builder /out/tgtldr /app/tgtldr
+USER app
+ENV TGTLDR_HTTP_ADDR=:8080
+EXPOSE 8080
+CMD ["/app/tgtldr"]

@@ -1,0 +1,69 @@
+services:
+  postgres:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: tgtldr
+      POSTGRES_USER: tgtldr
+      POSTGRES_PASSWORD: ${TGTLDR_DB_PASSWORD:?Initialize the local environment first}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U tgtldr -d tgtldr"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  app:
+    build:
+      context: .
+      dockerfile: deploy/docker/app.Dockerfile
+    image: tgtldr-activity-app:local
+    restart: unless-stopped
+    environment:
+      TGTLDR_STORAGE_PROTECTED: ${TGTLDR_STORAGE_PROTECTED:-false}
+      TGTLDR_DATABASE_URL: postgres://tgtldr:${TGTLDR_DB_PASSWORD:?Initialize the local environment first}@postgres:5432/tgtldr?sslmode=disable
+      TGTLDR_MASTER_KEY_FILE: /var/lib/tgtldr/master.key
+      TGTLDR_WEB_ORIGIN: http://localhost:${TGTLDR_HOST_WEB_PORT:-3000}
+      TGTLDR_HTTP_ADDR: :8080
+      TGTLDR_MEDIA_DIR: /var/lib/tgtldr/media
+      TGTLDR_TELEGRAM_PROXY_URL: ${TGTLDR_TELEGRAM_PROXY_URL:-}
+      HTTP_PROXY: ${HTTP_PROXY:-}
+      HTTPS_PROXY: ${HTTPS_PROXY:-}
+      NO_PROXY: ${NO_PROXY:-localhost,127.0.0.1,host.docker.internal,postgres,app,web}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    volumes:
+      - app-data:/var/lib/tgtldr
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "-T", "3", "http://127.0.0.1:8080/api/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
+
+  web:
+    build:
+      context: .
+      dockerfile: deploy/docker/web.Dockerfile
+    image: tgtldr-activity-web:local
+    restart: unless-stopped
+    environment:
+      TGTLDR_INTERNAL_API_BASE_URL: http://app:8080
+      HOSTNAME: 0.0.0.0
+    depends_on:
+      app:
+        condition: service_healthy
+    ports:
+      - "127.0.0.1:${TGTLDR_HOST_WEB_PORT:-3000}:3000"
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3000/', {signal: AbortSignal.timeout(3000)}).then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
+
+volumes:
+  app-data:
+  postgres-data:

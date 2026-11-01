@@ -1,0 +1,10 @@
+services:
+  app:
+    environment:
+      TGTLDR_MASTER_KEY_FILE: /run/secrets/activity_master_key
+    secrets:
+      - activity_master_key
+
+secrets:
+  activity_master_key:
+    file: ./.local/windows/master.key

@@ -1,0 +1,649 @@
+"use client";
+
+import Link from "next/link";
+import {
+  startTransition,
+  useCallback,
+  useDeferredValue,
+  useEffect,
+  useMemo,
+  useRef,
+  useState
+} from "react";
+import { api } from "@/lib/api";
+import { AppSelect } from "@/components/app-select";
+import { ChatActivityStrip } from "@/components/chat-activity-strip";
+import { ChatHistorySearchForm } from "@/components/chat-history-search-form";
+import { GlobalChatMessageSearch } from "@/components/global-chat-message-search";
+import { Chat, TelegramAccountChat } from "@/lib/types";
+import { DashboardPage, EmptyState, MetricCard, MetricRail, Surface } from "@/components/dashboard-page";
+import { useToast } from "@/components/toast";
+import { Button, Field, Input, StatusPill } from "@/components/ui";
+import { onHistoryBackfillCompleted } from "@/lib/history-backfill-sync";
+
+type ChatTypeFilter = "all" | Chat["chatType"];
+type SwitchFilter = "all" | "yes" | "no";
+type HistoryMode = "1d" | "3d" | "7d" | "30d" | "custom";
+
+const historyRangeOptions = [
+  { value: "1d", label: "最近 1 天" },
+  { value: "3d", label: "最近 3 天" },
+  { value: "7d", label: "最近 7 天" },
+  { value: "30d", label: "最近 30 天" },
+  { value: "custom", label: "自定义日期范围" }
+];
+
+export function ChatsPanel() {
+  const [items, setItems] = useState<Chat[]>([]);
+  const [savedItems, setSavedItems] = useState<Chat[]>([]);
+  const [editingId, setEditingId] = useState<number | null>(null);
+  const [query, setQuery] = useState("");
+  const [chatType, setChatType] = useState<ChatTypeFilter>("all");
+  const [messageSaveFilter, setMessageSaveFilter] = useState<SwitchFilter>("all");
+  const [summaryFilter, setSummaryFilter] = useState<SwitchFilter>("all");
+  const [messageSearchOpen, setMessageSearchOpen] = useState(false);
+  const [messageQuery, setMessageQuery] = useState("");
+  const [messageSearchPage, setMessageSearchPage] = useState(1);
+  const [activityAIEnabled, setActivityAIEnabled] = useState<boolean | null>(null);
+  const deferredQuery = useDeferredValue(query);
+  const toast = useToast();
+  const showErrorRef = useRef(toast.showError);
+
+  useEffect(() => {
+    showErrorRef.current = toast.showError;
+  }, [toast.showError]);
+
+  const load = useCallback(async () => {
+    try {
+      const [chatData, activityConfig] = await Promise.all([api.listChats(), api.activityConfig()]);
+      const chats = chatData.map(normalizeChat);
+      setItems(chats);
+      setSavedItems(chats);
+      setActivityAIEnabled(activityConfig.aiEnabled);
+      setEditingId((current) =>
+        current && chats.some((chat) => chat.id === current) ? current : null
+      );
+    } catch (err) {
+      showErrorRef.current(asMessage(err));
+    }
+  }, []);
+
+  useEffect(() => {
+    void load();
+  }, [load]);
+
+  useEffect(() => {
+    return onHistoryBackfillCompleted(() => {
+      void load();
+    });
+  }, [load]);
+
+  useEffect(() => {
+    const refreshAIStatus = async () => {
+      try { setActivityAIEnabled((await api.activityConfig()).aiEnabled); }
+      catch { /* Keep the last confirmed state during temporary network failures. */ }
+    };
+    const timer = setInterval(() => void refreshAIStatus(), 15000);
+    window.addEventListener("focus", refreshAIStatus);
+    return () => { clearInterval(timer); window.removeEventListener("focus", refreshAIStatus); };
+  }, []);
+
+  async function saveChat(chat: Chat) {
+    try {
+      await api.saveChat(chat);
+      toast.showSuccess(`已保存「${chat.title}」的配置。`);
+      await load();
+    } catch (err) {
+      toast.showError(asMessage(err));
+    }
+  }
+
+  async function startHistoryBackfill(chat: Chat, fromDate: string, toDate: string) {
+    try {
+      const task = await api.startHistoryBackfill(chat.id, fromDate, toDate);
+      toast.watchHistoryBackfill(task);
+    } catch (err) {
+      toast.showError(asMessage(err));
+    }
+  }
+
+  function patchChat(chatID: number, patch: Partial<Chat>) {
+    setItems((current) =>
+      current.map((item) => (item.id === chatID ? { ...item, ...patch } : item))
+    );
+  }
+
+  const filtered = useMemo(() => {
+    return items.filter((chat) => {
+      if (!chat.title.toLowerCase().includes(deferredQuery.toLowerCase())) {
+        return false;
+      }
+      if (chatType !== "all" && chat.chatType !== chatType) {
+        return false;
+      }
+      if (messageSaveFilter !== "all") {
+        const expected = messageSaveFilter === "yes";
+        if (chat.enabled !== expected) {
+          return false;
+        }
+      }
+      if (summaryFilter !== "all") {
+        const expected = summaryFilter === "yes";
+        if ((activityAIEnabled === true && savedItems.some((saved) => saved.id === chat.id && saved.enabled)) !== expected) {
+          return false;
+        }
+      }
+      return true;
+    });
+  }, [chatType, deferredQuery, items, messageSaveFilter, summaryFilter, activityAIEnabled, savedItems]);
+
+  const syncedCount = savedItems.length;
+  const messageSaveCount = savedItems.filter((chat) => chat.enabled).length;
+  const summaryEnabledCount = activityAIEnabled ? messageSaveCount : 0;
+
+  return (
+    <DashboardPage
+      title="群组"
+      description="选择需要监控的群组与频道；开启 AI 后，已监听群组会自动整理新文字。"
+    >
+      <MetricRail>
+        <MetricCard
+          label="已同步群组"
+          value={syncedCount}
+          badge="最新"
+          detail="所有已绑定 Telegram 账号下可管理的群组与超级群组。"
+        />
+        <MetricCard
+          label="已启用消息保存"
+          value={messageSaveCount}
+          tone={messageSaveCount > 0 ? "good" : "neutral"}
+          badge={messageSaveCount > 0 ? "运行中" : "未启用"}
+          detail="启用后，系统会实时保存该群的消息。"
+        />
+        <MetricCard
+          label="已启用 AI 总结"
+          value={activityAIEnabled === null ? "—" : summaryEnabledCount}
+          tone={summaryEnabledCount > 0 ? "good" : "neutral"}
+          badge={activityAIEnabled === null ? "读取中" : activityAIEnabled ? "已启用" : "未启用"}
+          detail="AI 总结跟随活动助手的总开关，仅处理已启用消息保存的群组。"
+        />
+      </MetricRail>
+
+      <Surface
+        actions={(
+          <button
+            aria-label={messageSearchOpen ? "收起聊天记录搜索" : "展开聊天记录搜索"}
+            aria-pressed={messageSearchOpen}
+            className={`chat-history-icon-button${messageSearchOpen ? " active" : ""}`}
+            onClick={() => {
+              if (messageSearchOpen) {
+                setMessageQuery("");
+                setMessageSearchPage(1);
+              }
+              setMessageSearchOpen((open) => !open);
+            }}
+            title={messageSearchOpen ? "收起搜索" : "搜索聊天记录"}
+            type="button"
+          >
+            <SearchIcon />
+          </button>
+        )}
+        className="chat-list-surface"
+        title="群组列表"
+        description="选择需要保存消息的群组，查看 AI 状态，或回补历史消息。"
+      >
+        {messageSearchOpen ? (
+          <ChatHistorySearchForm
+            ariaLabel="搜索所有群组聊天记录"
+            onQueryChange={(nextQuery) => {
+              setMessageQuery(nextQuery);
+              setMessageSearchPage(1);
+            }}
+            placeholder="搜索所有群组内的消息、发言人或 @username"
+            query={messageQuery}
+          />
+        ) : null}
+
+        {messageQuery ? (
+          <GlobalChatMessageSearch
+            onPageChange={setMessageSearchPage}
+            page={messageSearchPage}
+            query={messageQuery}
+          />
+        ) : (
+          <>
+            <div className="toolbar-grid">
+              <Field label="搜索群组">
+                <Input
+                  placeholder="按群名搜索"
+                  value={query}
+                  onChange={(event) => setQuery(event.target.value)}
+                />
+              </Field>
+              <Field label="群类型">
+                <AppSelect
+                  onChange={(value) => setChatType(value as ChatTypeFilter)}
+                  options={[
+                    { value: "all", label: "全部" },
+                    { value: "group", label: "群组" },
+                    { value: "supergroup", label: "超级群组" }
+                  ]}
+                  value={chatType}
+                />
+              </Field>
+              <Field label="消息保存">
+                <AppSelect
+                  onChange={(value) => setMessageSaveFilter(value as SwitchFilter)}
+                  options={[
+                    { value: "all", label: "全部" },
+                    { value: "yes", label: "已启用" },
+                    { value: "no", label: "未启用" }
+                  ]}
+                  value={messageSaveFilter}
+                />
+              </Field>
+              <Field label="AI 总结">
+                <AppSelect
+                  onChange={(value) => setSummaryFilter(value as SwitchFilter)}
+                  options={[
+                    { value: "all", label: "全部" },
+                    { value: "yes", label: "已启用" },
+                    { value: "no", label: "未启用" }
+                  ]}
+                  value={summaryFilter}
+                />
+              </Field>
+            </div>
+
+            {filtered.length === 0 ? (
+              <EmptyState
+                title="没有匹配的群组"
+                description="调整筛选条件后再试一次。"
+              />
+            ) : (
+              <div className="data-table-wrap">
+                <table className="data-table">
+                  <thead>
+                    <tr>
+                      <th>群组名称</th>
+                      <th>群类型</th>
+                      <th>消息保存</th>
+                      <th>AI 总结</th>
+                      <th>操作</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {filtered.map((chat) => (
+                      <ChatTableRow
+                        key={chat.id}
+                        chat={chat}
+                        aiEnabled={activityAIEnabled}
+                        aiActive={activityAIEnabled === true && savedItems.some((saved) => saved.id === chat.id && saved.enabled)}
+                        editing={editingId === chat.id}
+                        onBackfill={(fromDate, toDate) =>
+                          startTransition(() => void startHistoryBackfill(chat, fromDate, toDate))
+                        }
+                        onPatch={(patch) => patchChat(chat.id, patch)}
+                        onEdit={() =>
+                          setEditingId((current) => (current === chat.id ? null : chat.id))
+                        }
+                        onSave={() => startTransition(() => void saveChat(chat))}
+                      />
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            )}
+          </>
+        )}
+      </Surface>
+
+    </DashboardPage>
+  );
+}
+
+function asMessage(err: unknown) {
+  if (err instanceof Error) {
+    return err.message;
+  }
+  return String(err);
+}
+
+function normalizeChat(chat: Chat): Chat {
+  return {
+    ...chat,
+    summaryContext: chat.summaryContext ?? "",
+    filteredKeywords: Array.isArray(chat.filteredKeywords) ? chat.filteredKeywords : [],
+    filteredSenders: Array.isArray(chat.filteredSenders) ? chat.filteredSenders : [],
+    keepBotMessages: chat.keepBotMessages ?? true,
+    messageActivity: Array.isArray(chat.messageActivity) ? chat.messageActivity : [],
+    availableAccounts: Array.isArray(chat.availableAccounts) ? chat.availableAccounts : []
+  };
+}
+
+function ChatTableRow({
+  aiEnabled,
+  aiActive,
+  chat,
+  editing,
+  onBackfill,
+  onPatch,
+  onEdit,
+  onSave
+}: {
+  aiEnabled: boolean | null;
+  aiActive: boolean;
+  chat: Chat;
+  editing: boolean;
+  onBackfill: (fromDate: string, toDate: string) => void;
+  onPatch: (patch: Partial<Chat>) => void;
+  onEdit: () => void;
+  onSave: () => void;
+}) {
+  const [historyMode, setHistoryMode] = useState<HistoryMode>("30d");
+  const [historyFromDate, setHistoryFromDate] = useState(localDateOffset(-29));
+  const [historyToDate, setHistoryToDate] = useState(localDateInputValue());
+  const [historyExpanded, setHistoryExpanded] = useState(false);
+  const historyRange = resolveHistoryRange(historyMode, historyFromDate, historyToDate);
+  const expanded = editing || historyExpanded;
+  const collectorAccounts = availableCollectorAccounts(chat);
+  const selectedCollectorAccount = chat.availableAccounts.find(
+    (account) => account.accountId === chat.collectorAccountId,
+  );
+  const shouldShowCollectorAccount =
+    chat.availableAccounts.length > 1 && selectedCollectorAccount !== undefined;
+
+  return (
+    <>
+      <tr className={expanded ? "data-row active" : "data-row"}>
+        <td>
+          <div className="data-row-title">
+            <div className="chat-identity">
+              <ChatAvatar key={chat.avatarUrl ?? "fallback"} src={chat.avatarUrl} />
+              <div className="chat-identity-copy">
+                <Link
+                  className="chat-summary-link"
+                  href={`/dashboard/chats/${encodeURIComponent(String(chat.id))}/messages`}
+                >
+                  {chat.title}
+                </Link>
+                <div className="chat-secondary-line">
+                  <span>{chat.username ? `@${chat.username}` : "无公开用户名"}</span>
+                  {shouldShowCollectorAccount ? (
+                    <span className="chat-collector-account">
+                      · {formatCollectorAccount(selectedCollectorAccount)}
+                    </span>
+                  ) : null}
+                </div>
+              </div>
+            </div>
+            <ChatActivityStrip
+              activity={chat.messageActivity ?? []}
+              hrefForDate={(date) =>
+                `/dashboard/chats/${encodeURIComponent(String(chat.id))}/messages?date=${encodeURIComponent(date)}`
+              }
+            />
+          </div>
+        </td>
+        <td>{chat.chatType === "supergroup" ? "超级群组" : "群组"}</td>
+        <td>
+          <StatusPill tone={chat.enabled ? "good" : "neutral"}>
+            {chat.enabled ? "已启用" : "未启用"}
+          </StatusPill>
+        </td>
+        <td>
+          <StatusPill tone={aiActive ? "good" : "neutral"}>
+            {aiEnabled === null ? "读取中" : aiActive ? "已启用" : "未启用"}
+          </StatusPill>
+        </td>
+        <td>
+          <div className="table-row-actions">
+            <Button
+              aria-label={editing ? "收起编辑" : "编辑群组配置"}
+              className={editing ? "table-icon-button active" : "table-icon-button"}
+              onClick={onEdit}
+              title={editing ? "收起编辑" : "编辑群组配置"}
+              type="button"
+              variant="ghost"
+            >
+              <EditIcon />
+            </Button>
+            <Button
+              aria-label={historyExpanded ? "收起历史消息回补" : "加载历史消息"}
+              className={historyExpanded ? "table-icon-button active" : "table-icon-button"}
+              onClick={() => setHistoryExpanded((current) => !current)}
+              title={historyExpanded ? "收起历史消息回补" : "加载历史消息"}
+              type="button"
+              variant="ghost"
+            >
+              <HistoryIcon />
+            </Button>
+          </div>
+        </td>
+      </tr>
+
+      {expanded ? (
+        <tr className="data-row-detail">
+          <td colSpan={5}>
+            <div className="table-editor">
+              {editing ? (
+                <>
+                  <div className="form-grid table-editor-primary-grid">
+                    <Field label="使用账号">
+                      <AppSelect
+                        disabled={collectorAccounts.length <= 1}
+                        onChange={(value) =>
+                          onPatch({ collectorAccountId: Number(value) })
+                        }
+                        options={collectorAccounts.map((account) => ({
+                          value: String(account.accountId),
+                          label: `${account.accountName || "Telegram 账号"}${account.accountHandle ? ` (@${account.accountHandle})` : ""}${account.accountStatus === "authorized" ? "" : " · 需要重新登录"}`
+                        }))}
+                        value={String(chat.collectorAccountId || "")}
+                      />
+                    </Field>
+                    <Field label="消息保存">
+                      <AppSelect
+                        onChange={(value) => onPatch({ enabled: value === "yes" })}
+                        options={[
+                          { value: "yes", label: "启用" },
+                          { value: "no", label: "停用" }
+                        ]}
+                        value={chat.enabled ? "yes" : "no"}
+                      />
+                    </Field>
+
+                    <Field label="AI 总结" hint="在活动助手中统一开关，开启后自动覆盖已监听群组。">
+                      <StatusPill tone={aiActive ? "good" : "neutral"}>
+                        {aiEnabled === null ? "读取中" : aiActive ? "已启用" : "未启用"}
+                      </StatusPill>
+                      <Link href="/dashboard/activities">前往活动助手设置 AI</Link>
+                    </Field>
+                  </div>
+
+                  <div className="editor-footer">
+                    <p className="muted">
+                      当前群类型：{chat.chatType === "supergroup" ? "超级群组" : "群组"}
+                    </p>
+                    <Button onClick={onSave} type="button">
+                      保存该群配置
+                    </Button>
+                  </div>
+                </>
+              ) : null}
+
+              {historyExpanded ? (
+                <div className="history-backfill-panel">
+                  <div className="history-backfill-head">
+                    <strong>加载历史消息</strong>
+                    <p>回补后，这个群较早时间段的消息也可以用于生成摘要。</p>
+                  </div>
+                  <div className="form-grid">
+                    <Field label="时间范围">
+                      <AppSelect
+                        onChange={(value) => setHistoryMode(value as HistoryMode)}
+                        options={historyRangeOptions}
+                        value={historyMode}
+                      />
+                    </Field>
+                    {historyMode === "custom" ? (
+                      <>
+                        <Field label="开始日期">
+                          <Input
+                            type="date"
+                            value={historyFromDate}
+                            onChange={(event) => setHistoryFromDate(event.target.value)}
+                          />
+                        </Field>
+                        <Field label="结束日期">
+                          <Input
+                            type="date"
+                            value={historyToDate}
+                            onChange={(event) => setHistoryToDate(event.target.value)}
+                          />
+                        </Field>
+                      </>
+                    ) : (
+                      <div className="history-backfill-range muted">
+                        将回补 {historyRange.fromDate} 到 {historyRange.toDate} 的消息。
+                      </div>
+                    )}
+                  </div>
+                  <div className="history-backfill-actions">
+                    <Button
+                      disabled={!historyRange.fromDate || !historyRange.toDate}
+                      onClick={() => onBackfill(historyRange.fromDate, historyRange.toDate)}
+                      type="button"
+                      variant="secondary"
+                    >
+                      加载历史消息
+                    </Button>
+                  </div>
+                </div>
+              ) : null}
+            </div>
+          </td>
+        </tr>
+      ) : null}
+    </>
+  );
+}
+
+// ChatAvatar 始终保留群图标位置，真实头像缺失或加载失败时展示统一占位图标。
+function ChatAvatar({ src }: { src?: string }) {
+  const [failed, setFailed] = useState(false);
+  const showFallback = !src || failed;
+
+  return (
+    <span className={showFallback ? "chat-list-avatar-frame fallback" : "chat-list-avatar-frame"}>
+      {showFallback ? (
+        <GroupIcon />
+      ) : (
+        <img alt="" className="chat-list-avatar" onError={() => setFailed(true)} src={src} />
+      )}
+    </span>
+  );
+}
+
+// GroupIcon 使用中性的双人轮廓表示没有可用头像的群组。
+function GroupIcon() {
+  return (
+    <svg aria-hidden="true" fill="none" viewBox="0 0 24 24">
+      <path d="M8.5 11a3 3 0 1 0 0-6 3 3 0 0 0 0 6Z" />
+      <path d="M15.8 10a2.4 2.4 0 1 0 0-4.8" />
+      <path d="M3.5 18.5v-1.2a4.5 4.5 0 0 1 4.5-4.5h1a4.5 4.5 0 0 1 4.5 4.5v1.2" />
+      <path d="M14.2 13.2a4 4 0 0 1 6.3 3.3v1" />
+    </svg>
+  );
+}
+
+function SearchIcon() {
+  return <svg aria-hidden="true" fill="none" viewBox="0 0 24 24"><circle cx="10.8" cy="10.8" r="6.3" stroke="currentColor" strokeWidth="1.8" /><path d="m16 16 4 4" stroke="currentColor" strokeLinecap="round" strokeWidth="1.8" /></svg>;
+}
+
+function availableCollectorAccounts(chat: Chat) {
+  return chat.availableAccounts.filter(
+    (account) =>
+      account.accountStatus === "authorized" ||
+      account.accountId === chat.collectorAccountId
+  );
+}
+
+function formatCollectorAccount(account: TelegramAccountChat) {
+  const name = account.accountName || "Telegram 账号";
+  return account.accountHandle ? `${name} (@${account.accountHandle})` : name;
+}
+
+function resolveHistoryRange(
+  mode: HistoryMode,
+  customFromDate: string,
+  customToDate: string
+) {
+  if (mode === "custom") {
+    return { fromDate: customFromDate, toDate: customToDate };
+  }
+  const days = Number.parseInt(mode, 10);
+  return { fromDate: localDateOffset(1 - days), toDate: localDateInputValue() };
+}
+
+function localDateOffset(offsetDays: number) {
+  const now = new Date();
+  now.setDate(now.getDate() + offsetDays);
+  const local = new Date(now.getTime() - now.getTimezoneOffset() * 60_000);
+  return local.toISOString().slice(0, 10);
+}
+
+function localDateInputValue() {
+  const now = new Date();
+  const local = new Date(now.getTime() - now.getTimezoneOffset() * 60_000);
+  return local.toISOString().slice(0, 10);
+}
+
+function EditIcon() {
+  return (
+    <svg aria-hidden="true" fill="none" height="16" viewBox="0 0 24 24" width="16">
+      <path
+        d="M4 20h4l10-10-4-4L4 16v4Z"
+        stroke="currentColor"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+        strokeWidth="1.8"
+      />
+      <path
+        d="M13.5 6.5l4 4"
+        stroke="currentColor"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+        strokeWidth="1.8"
+      />
+    </svg>
+  );
+}
+
+function HistoryIcon() {
+  return (
+    <svg aria-hidden="true" fill="none" height="16" viewBox="0 0 24 24" width="16">
+      <path
+        d="M3 12a9 9 0 1 0 3-6.708"
+        stroke="currentColor"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+        strokeWidth="1.8"
+      />
+      <path
+        d="M3 4v4h4"
+        stroke="currentColor"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+        strokeWidth="1.8"
+      />
+      <path
+        d="M12 7.5v5l3 2"
+        stroke="currentColor"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+        strokeWidth="1.8"
+      />
+    </svg>
+  );
+}

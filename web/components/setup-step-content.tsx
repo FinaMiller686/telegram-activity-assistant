@@ -1,0 +1,832 @@
+"use client";
+
+import { startTransition } from "react";
+import { AppSelect } from "@/components/app-select";
+import {
+  AppSettings,
+  Bootstrap,
+  BotTargetChatCandidate,
+  PendingAuth,
+} from "@/lib/types";
+import {
+  describeBotChatCandidate,
+  hasAvailableBotToken,
+} from "@/lib/bot-target-chat";
+import { Button, Card, Field, Input } from "@/components/ui";
+import { knownOpenAIModels, LoginStage } from "@/components/setup-wizard-types";
+import { Language } from "@/lib/types";
+import { useI18n } from "@/lib/i18n";
+
+type ConfigStepProps = {
+  settings: AppSettings;
+  setSettings: (settings: AppSettings) => void;
+  canSave: boolean;
+  testingOpenAI: boolean;
+  onTestOpenAI: () => void;
+  onSaveAndContinue: () => void;
+};
+
+export function ConfigStep({
+  settings,
+  setSettings,
+  canSave,
+  testingOpenAI,
+  onTestOpenAI,
+  onSaveAndContinue,
+}: ConfigStepProps) {
+  const { dict } = useI18n();
+  const customModel = !knownOpenAIModels.includes(
+    settings.openAIModel as (typeof knownOpenAIModels)[number],
+  );
+
+  return (
+    <Card title="基础配置">
+      <p>账号和消息保存在自己的电脑上。首次连接前，请按对应系统的安装说明设置数据保护。</p>
+      <div className="setup-stage">
+        <div className="setup-config-grid">
+          <section className="setup-config-panel">
+            <div className="setup-config-head">
+              <div>
+                <h3>Telegram App</h3>
+                <p className="setup-panel-note">
+                  请在 my.telegram.org 创建 Telegram App，然后填写 API ID 和 API Hash。
+                </p>
+              </div>
+              <ExternalLink href="https://my.telegram.org/apps">
+                申请 API ID / Hash
+              </ExternalLink>
+            </div>
+            <div className="form-stack">
+              <Field label="Telegram API ID" required>
+                <Input
+                  aria-invalid={settings.telegramApiId === 0}
+                  value={settings.telegramApiId || ""}
+                  onChange={(event) =>
+                    setSettings({
+                      ...settings,
+                      telegramApiId: Number(event.target.value || "0"),
+                    })
+                  }
+                />
+              </Field>
+              <Field label="Telegram API Hash" required>
+                <Input
+                  aria-invalid={(settings.telegramApiHash ?? "").trim() === ""}
+                  type="password"
+                  value={settings.telegramApiHash || ""}
+                  onChange={(event) =>
+                    setSettings({
+                      ...settings,
+                      telegramApiHash: event.target.value,
+                    })
+                  }
+                />
+              </Field>
+            </div>
+          </section>
+
+          <section className="setup-config-panel">
+            <div className="setup-config-head">
+              <div>
+                <h3>OpenAI 摘要</h3>
+                <p className="setup-panel-note">AI 默认关闭；本地模型可不填 API Key。</p>
+              </div>
+              <ExternalLink href="https://platform.openai.com/api-keys">
+                创建 API Key
+              </ExternalLink>
+            </div>
+            <div className="form-stack">
+              <Field label="OpenAI Base URL">
+                <Input
+                  value={settings.openAIBaseUrl}
+                  onChange={(event) =>
+                    setSettings({
+                      ...settings,
+                      openAIBaseUrl: event.target.value,
+                    })
+                  }
+                />
+              </Field>
+              <Field label="OpenAI API Key">
+                <Input
+                  type="password"
+                  value={settings.openAIApiKey || ""}
+                  onChange={(event) =>
+                    setSettings({
+                      ...settings,
+                      openAIApiKey: event.target.value,
+                    })
+                  }
+                />
+              </Field>
+              <Field label="Model" required>
+                <AppSelect
+                  onChange={(value) =>
+                    setSettings({
+                      ...settings,
+                      openAIModel: value === "__custom__" ? "" : value,
+                    })
+                  }
+                  options={[
+                    ...knownOpenAIModels.map((model) => ({
+                      value: model,
+                      label: model,
+                    })),
+                    { value: "__custom__", label: "自定义模型名" },
+                  ]}
+                  value={customModel ? "__custom__" : settings.openAIModel}
+                />
+              </Field>
+              {customModel ? (
+                <Field
+                  label="自定义模型名"
+                  hint="如果你使用兼容 OpenAI 的其他服务，可以手动填写模型名。"
+                  required
+                >
+                  <Input
+                    aria-invalid={settings.openAIModel.trim() === ""}
+                    value={settings.openAIModel}
+                    onChange={(event) =>
+                      setSettings({
+                        ...settings,
+                        openAIModel: event.target.value,
+                      })
+                    }
+                  />
+                </Field>
+              ) : null}
+              <div>
+                <Button
+                  disabled={testingOpenAI}
+                  onClick={() => startTransition(onTestOpenAI)}
+                  type="button"
+                  variant="secondary"
+                >
+                  {testingOpenAI ? "测试中..." : "测试连接"}
+                </Button>
+              </div>
+            </div>
+
+            <details className="setup-details">
+              <summary>高级参数</summary>
+              <div className="form-stack">
+                <Field label="Temperature">
+                  <Input
+                    type="number"
+                    step="0.1"
+                    value={settings.openAITemperature}
+                    onChange={(event) =>
+                      setSettings({
+                        ...settings,
+                        openAITemperature: Number(event.target.value || "0"),
+                      })
+                    }
+                  />
+                </Field>
+                <Field
+                  label="输出长度"
+                  hint="自动模式不设置显式输出上限；自定义模式会应用 Max Output Tokens 限制。"
+                >
+                  <AppSelect
+                    onChange={(value) =>
+                      setSettings({
+                        ...settings,
+                        openAIOutputMode: value as "auto" | "manual",
+                      })
+                    }
+                    options={[
+                      { value: "auto", label: "自动" },
+                      { value: "manual", label: "自定义" },
+                    ]}
+                    value={settings.openAIOutputMode}
+                  />
+                </Field>
+                {settings.openAIOutputMode === "manual" ? (
+                  <Field label="Max Output Tokens">
+                    <Input
+                      type="number"
+                      value={settings.openAIMaxOutputTokens}
+                      onChange={(event) =>
+                        setSettings({
+                          ...settings,
+                          openAIMaxOutputTokens: Number(
+                            event.target.value || "0",
+                          ),
+                        })
+                      }
+                    />
+                  </Field>
+                ) : null}
+                <Field
+                  label="上下文长度"
+                  hint="自动模式会识别已知模型；自定义模型或转发服务可手动填写实际上下文窗口。"
+                >
+                  <AppSelect
+                    onChange={(value) =>
+                      setSettings({
+                        ...settings,
+                        openAIContextWindowMode: value as "auto" | "manual",
+                      })
+                    }
+                    options={[
+                      { value: "auto", label: "自动识别" },
+                      { value: "manual", label: "自定义" },
+                    ]}
+                    value={settings.openAIContextWindowMode}
+                  />
+                </Field>
+                {settings.openAIContextWindowMode === "manual" ? (
+                  <Field label="Context Window Tokens">
+                    <Input
+                      min="4096"
+                      step="1"
+                      type="number"
+                      value={settings.openAIContextWindowTokens}
+                      onChange={(event) =>
+                        setSettings({
+                          ...settings,
+                          openAIContextWindowTokens: Number(
+                            event.target.value || "0",
+                          ),
+                        })
+                      }
+                    />
+                  </Field>
+                ) : null}
+                <Field
+                  label="调用方式"
+                  hint="流式更适合转发站，可降低网关等待完整响应导致的超时风险。"
+                >
+                  <AppSelect
+                    onChange={(value) =>
+                      setSettings({
+                        ...settings,
+                        openAIRequestMode: value as "stream" | "non_stream",
+                      })
+                    }
+                    options={[
+                      { value: "stream", label: "流式" },
+                      { value: "non_stream", label: "非流式" },
+                    ]}
+                    value={settings.openAIRequestMode || "stream"}
+                  />
+                </Field>
+                <Field
+                  label="并发摘要数"
+                  hint="最多同时总结多少个消息分块。"
+                >
+                  <AppSelect
+                    onChange={(value) =>
+                      setSettings({
+                        ...settings,
+                        summaryParallelism: Number(value),
+                      })
+                    }
+                    options={[
+                      { value: "1", label: "1" },
+                      { value: "2", label: "2" },
+                      { value: "3", label: "3" },
+                      { value: "4", label: "4" },
+                      { value: "5", label: "5" },
+                      { value: "6", label: "6" },
+                    ]}
+                    value={String(settings.summaryParallelism || 2)}
+                  />
+                </Field>
+              </div>
+            </details>
+          </section>
+
+          <section className="setup-config-panel">
+            <div className="setup-config-head">
+              <div>
+                <h3>偏好设置</h3>
+                <p className="setup-panel-note">
+                  这些设置会控制摘要日期、定时任务和默认输出语言。
+                </p>
+              </div>
+            </div>
+            <div className="form-grid compact">
+              <Field label="默认时区">
+                <Input
+                  value={settings.defaultTimezone}
+                  onChange={(event) =>
+                    setSettings({
+                      ...settings,
+                      defaultTimezone: event.target.value,
+                    })
+                  }
+                />
+              </Field>
+              <Field label={dict.language.label} hint={dict.language.hint}>
+                <AppSelect
+                  onChange={(value) => {
+                    const language = value as Language;
+                    setSettings({ ...settings, language });
+                  }}
+                  options={[
+                    { value: "zh-CN", label: dict.language.zhCN },
+                    { value: "en", label: dict.language.en },
+                  ]}
+                  value={settings.language}
+                />
+              </Field>
+            </div>
+          </section>
+        </div>
+
+        <div className="setup-actions">
+          <Button
+            disabled={!canSave}
+            onClick={() => startTransition(onSaveAndContinue)}
+            type="button"
+          >
+            保存并继续
+          </Button>
+        </div>
+      </div>
+    </Card>
+  );
+}
+
+type LoginStepProps = {
+  bootstrap: Bootstrap | null;
+  loginStage: LoginStage;
+  countryCode: string;
+  setCountryCode: (value: string) => void;
+  phoneNumber: string;
+  setPhoneNumber: (value: string) => void;
+  code: string;
+  setCode: (value: string) => void;
+  password: string;
+  setPassword: (value: string) => void;
+  pendingAuth: PendingAuth | null;
+  discoveredChats: number;
+  authBlocked: boolean;
+  authBlockedLabel: string | null;
+  onBack: () => void;
+  onContinueFromPhone: () => void;
+  onSubmitCode: () => void;
+  onSubmitPassword: () => void;
+  onResetToPhone: () => void;
+  onContinueToBot: () => void;
+  onResendCode: () => void;
+  onRetrySyncChats: () => void;
+};
+
+export function LoginStep(props: LoginStepProps) {
+  const {
+    bootstrap,
+    loginStage,
+    countryCode,
+    setCountryCode,
+    phoneNumber,
+    setPhoneNumber,
+    code,
+    setCode,
+    password,
+    setPassword,
+    pendingAuth,
+    discoveredChats,
+    authBlocked,
+    authBlockedLabel,
+    onBack,
+    onContinueFromPhone,
+    onSubmitCode,
+    onSubmitPassword,
+    onResetToPhone,
+    onContinueToBot,
+    onResendCode,
+    onRetrySyncChats,
+  } = props;
+
+  return (
+    <Card title="登录 Telegram">
+      <div className="setup-stage">
+        {loginStage === "phone" ? (
+          <>
+            <div className="setup-auth-block">
+              <p className="setup-auth-title">登录 Telegram</p>
+              <p className="setup-helper">
+                登录后，TGTLDR 会显示为一台已登录设备。
+              </p>
+              <div className="setup-phone-row">
+                <Field label="国家码">
+                  <Input
+                    value={countryCode}
+                    onChange={(event) => setCountryCode(event.target.value)}
+                    placeholder="+86"
+                  />
+                </Field>
+                <Field label="手机号">
+                  <Input
+                    value={phoneNumber}
+                    onChange={(event) => setPhoneNumber(event.target.value)}
+                    placeholder="13800138000"
+                  />
+                </Field>
+              </div>
+              {authBlockedLabel ? (
+                <p className="setup-helper">{authBlockedLabel}</p>
+              ) : null}
+            </div>
+            <div className="setup-actions">
+              <Button variant="ghost" onClick={onBack} type="button">
+                返回上一步
+              </Button>
+              <Button
+                disabled={authBlocked}
+                onClick={() => startTransition(onContinueFromPhone)}
+                type="button"
+              >
+                继续
+              </Button>
+            </div>
+          </>
+        ) : null}
+
+        {loginStage === "code" ? (
+          <>
+            <div className="setup-auth-block">
+              <p className="setup-auth-title">输入验证码</p>
+              <p className="setup-helper">
+                验证码已发送到 <strong>{pendingAuth?.phoneNumber}</strong>。
+              </p>
+              {authBlockedLabel ? (
+                <p className="setup-helper">{authBlockedLabel}</p>
+              ) : null}
+              <Field label="验证码">
+                <Input
+                  value={code}
+                  onChange={(event) => setCode(event.target.value)}
+                  placeholder="输入 Telegram 发来的验证码"
+                />
+              </Field>
+            </div>
+            <div className="setup-actions">
+              <div className="setup-inline-actions">
+                <Button
+                  variant="link"
+                  disabled={authBlocked}
+                  onClick={() => startTransition(onResendCode)}
+                  type="button"
+                >
+                  重新发送验证码
+                </Button>
+                <Button variant="link" onClick={onResetToPhone} type="button">
+                  返回修改手机号
+                </Button>
+              </div>
+              <Button
+                disabled={authBlocked}
+                onClick={() => startTransition(onSubmitCode)}
+                type="button"
+              >
+                继续
+              </Button>
+            </div>
+          </>
+        ) : null}
+
+        {loginStage === "password" ? (
+          <>
+            <div className="setup-auth-block">
+              <p className="setup-auth-title">输入两步验证密码</p>
+              {authBlockedLabel ? (
+                <p className="setup-helper">{authBlockedLabel}</p>
+              ) : null}
+              <Field label="两步验证密码">
+                <Input
+                  type="password"
+                  value={password}
+                  onChange={(event) => setPassword(event.target.value)}
+                  placeholder="输入你的两步验证密码"
+                />
+              </Field>
+            </div>
+            <div className="setup-actions">
+              <Button variant="link" onClick={onResetToPhone} type="button">
+                返回修改手机号
+              </Button>
+              <Button
+                disabled={authBlocked}
+                onClick={() => startTransition(onSubmitPassword)}
+                type="button"
+              >
+                继续
+              </Button>
+            </div>
+          </>
+        ) : null}
+
+        {loginStage === "success" ? (
+          <>
+            <div className="setup-auth-block">
+              <p className="setup-auth-title">
+                {discoveredChats > 0
+                  ? "已登录并同步群组"
+                  : "已登录，尚未同步群组"}
+              </p>
+              {discoveredChats === 0 ? (
+                <p className="setup-helper">
+                  群组列表为空，可以重试同步。
+                </p>
+              ) : null}
+              <div className="setup-metrics">
+                <div className="setup-metric">
+                  <span>登录账号</span>
+                  <strong>
+                    {bootstrap?.auth?.telegramName || "已授权账号"}
+                  </strong>
+                </div>
+                <div className="setup-metric">
+                  <span>发现群组</span>
+                  <strong>{discoveredChats}</strong>
+                </div>
+                <div className="setup-metric">
+                  <span>已启用消息保存</span>
+                  <strong>{bootstrap?.enabledChatCount ?? 0}</strong>
+                </div>
+              </div>
+            </div>
+            <div className="setup-actions">
+              <Button variant="ghost" onClick={onBack} type="button">
+                返回上一步
+              </Button>
+              <div className="setup-inline-actions">
+                {discoveredChats === 0 ? (
+                  <Button
+                    disabled={authBlocked}
+                    onClick={() => startTransition(onRetrySyncChats)}
+                    type="button"
+                  >
+                    重试同步群组
+                  </Button>
+                ) : null}
+                <Button onClick={onContinueToBot} type="button">
+                  继续
+                </Button>
+              </div>
+            </div>
+          </>
+        ) : null}
+      </div>
+    </Card>
+  );
+}
+
+type BotStepProps = {
+  botTargetChatCandidates: BotTargetChatCandidate[];
+  botTokenPlaceholder: string;
+  settings: AppSettings;
+  resolvingBotTargetChat: boolean;
+  setSettings: (settings: AppSettings) => void;
+  canContinue: boolean;
+  onBotTokenChange: (value: string) => void;
+  onBack: () => void;
+  onContinue: () => void;
+  onResolveBotTargetChat: () => void;
+  onSelectBotTargetChat: (candidate: BotTargetChatCandidate) => void;
+  telegramAuthorized: boolean;
+};
+
+export function BotStep({
+  botTargetChatCandidates,
+  botTokenPlaceholder,
+  settings,
+  resolvingBotTargetChat,
+  setSettings,
+  canContinue,
+  onBotTokenChange,
+  onBack,
+  onContinue,
+  onResolveBotTargetChat,
+  onSelectBotTargetChat,
+  telegramAuthorized,
+}: BotStepProps) {
+  return (
+    <Card title="Bot 推送">
+      <div className="setup-stage">
+        <div className="setup-choice-grid">
+          <button
+            className={`setup-choice ${settings.botEnabled ? "" : "active"}`}
+            onClick={() =>
+              setSettings({
+                ...settings,
+                botEnabled: false,
+              })
+            }
+            type="button"
+          >
+            <span className="setup-choice-title">仅在网页端查看摘要</span>
+          </button>
+          <button
+            className={`setup-choice ${settings.botEnabled ? "active" : ""}`}
+            onClick={() =>
+              setSettings({
+                ...settings,
+                botEnabled: true,
+              })
+            }
+            type="button"
+          >
+            <span className="setup-choice-title">
+              同时通过 Telegram Bot 推送
+            </span>
+          </button>
+        </div>
+
+        {settings.botEnabled ? (
+          <div className="setup-bot-fields">
+            <Field label="Bot Token" hint="启用 Bot 推送后必须填写。" required>
+              <Input
+                required
+                placeholder={botTokenPlaceholder || "启用 Bot 推送后必须填写。"}
+                type="password"
+                value={settings.botToken || ""}
+                onChange={(event) => onBotTokenChange(event.target.value)}
+              />
+            </Field>
+            <Field
+              as="div"
+              label="目标 Chat ID"
+              hint="先给 Bot 发消息，再点击“获取 Chat ID”自动绑定。"
+            >
+              <div className="bot-target-chat-field">
+                <p className="muted">
+                  1. 先在目标私聊或群聊里给 Bot 发一条消息。
+                  <br />
+                  2. 回到这里点击“获取 Chat ID”。
+                </p>
+                {!telegramAuthorized ? (
+                  <p className="field-hint">
+                    自动获取前需要先完成上一步的 Telegram 登录。
+                  </p>
+                ) : null}
+                <div className="button-row">
+                  <Button
+                    disabled={
+                      resolvingBotTargetChat ||
+                      !telegramAuthorized ||
+                      !hasAvailableBotToken(
+                        settings.botToken,
+                        botTokenPlaceholder,
+                      )
+                    }
+                    onClick={() => void onResolveBotTargetChat()}
+                    type="button"
+                    variant="secondary"
+                  >
+                    {resolvingBotTargetChat ? "正在获取..." : "获取 Chat ID"}
+                  </Button>
+                </div>
+                {botTargetChatCandidates.length > 1 ? (
+                  <div className="bot-chat-candidates">
+                    {botTargetChatCandidates.map((candidate) => (
+                      <Button
+                        className="bot-chat-candidate"
+                        key={candidate.chatId}
+                        onClick={() => onSelectBotTargetChat(candidate)}
+                        type="button"
+                        variant={
+                          settings.botTargetChatId === candidate.chatId
+                            ? "primary"
+                            : "secondary"
+                        }
+                      >
+                        {describeBotChatCandidate(candidate)}
+                      </Button>
+                    ))}
+                  </div>
+                ) : null}
+                <div
+                  aria-live="polite"
+                  className={`bot-target-chat-value ${settings.botTargetChatId ? "" : "empty"}`}
+                >
+                  {settings.botTargetChatId
+                    ? `当前将绑定：${settings.botTargetChatId}`
+                    : "尚未绑定 Chat ID"}
+                </div>
+                <span className="field-hint">
+                  获取成功后会显示在这里，并在“保存并完成”时一起保存。
+                </span>
+              </div>
+            </Field>
+          </div>
+        ) : null}
+
+        <div className="setup-actions">
+          <Button variant="ghost" onClick={onBack} type="button">
+            返回上一步
+          </Button>
+          <Button
+            disabled={!canContinue}
+            onClick={() => startTransition(onContinue)}
+            type="button"
+          >
+            保存并继续
+          </Button>
+        </div>
+      </div>
+    </Card>
+  );
+}
+
+type PasswordStepProps = {
+  accessPassword: string;
+  accessPasswordConfirm: string;
+  onBack?: () => void;
+  onChangeAccessPassword: (value: string) => void;
+  onChangeAccessPasswordConfirm: (value: string) => void;
+  onFinish: () => void;
+};
+
+export function PasswordStep({
+  accessPassword,
+  accessPasswordConfirm,
+  onBack,
+  onChangeAccessPassword,
+  onChangeAccessPasswordConfirm,
+  onFinish,
+}: PasswordStepProps) {
+  const passwordMismatch =
+    accessPasswordConfirm.trim() !== "" &&
+    accessPassword !== accessPasswordConfirm;
+
+  return (
+    <Card title="设置访问密码">
+      <div className="setup-stage">
+        <div className="setup-config-panel">
+          <div className="setup-config-head">
+            <div>
+              <h3>访问保护</h3>
+              <p className="setup-panel-note">
+                初始化完成后，后台页面和 API 都需要使用这个密码登录。
+              </p>
+            </div>
+          </div>
+          <div className="form-stack">
+            <Field
+              label="访问密码"
+              required
+              hint="至少 8 位。后续可以在系统配置中修改。"
+            >
+              <Input
+                autoComplete="new-password"
+                onChange={(event) => onChangeAccessPassword(event.target.value)}
+                type="password"
+                value={accessPassword}
+              />
+            </Field>
+            <Field
+              label="确认访问密码"
+              required
+              hint={passwordMismatch ? "两次输入的密码不一致。" : undefined}
+            >
+              <Input
+                aria-invalid={passwordMismatch}
+                autoComplete="new-password"
+                onChange={(event) =>
+                  onChangeAccessPasswordConfirm(event.target.value)
+                }
+                type="password"
+                value={accessPasswordConfirm}
+              />
+            </Field>
+          </div>
+        </div>
+        <div className="setup-actions">
+          {onBack ? (
+            <Button variant="ghost" onClick={onBack} type="button">
+              返回上一步
+            </Button>
+          ) : null}
+          <Button
+            disabled={
+              accessPassword.trim().length < 8 ||
+              accessPasswordConfirm.trim() === "" ||
+              passwordMismatch
+            }
+            onClick={() => startTransition(onFinish)}
+            type="button"
+          >
+            设置密码并继续
+          </Button>
+        </div>
+      </div>
+    </Card>
+  );
+}
+
+function ExternalLink({ children, href }: { children: string; href: string }) {
+  return (
+    <a
+      className="setup-inline-link"
+      href={href}
+      rel="noreferrer"
+      target="_blank"
+    >
+      {children}
+    </a>
+  );
+}

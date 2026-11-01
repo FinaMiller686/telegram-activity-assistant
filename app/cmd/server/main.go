@@ -1,0 +1,122 @@
+package main
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"net/http"
+	"os"
+	"os/signal"
+	"syscall"
+
+	"github.com/fr0der1c/tgtldr/app/internal/activity"
+	"github.com/fr0der1c/tgtldr/app/internal/api"
+	"github.com/fr0der1c/tgtldr/app/internal/bot"
+	"github.com/fr0der1c/tgtldr/app/internal/catchup"
+	"github.com/fr0der1c/tgtldr/app/internal/clock"
+	"github.com/fr0der1c/tgtldr/app/internal/config"
+	"github.com/fr0der1c/tgtldr/app/internal/dailydigest"
+	"github.com/fr0der1c/tgtldr/app/internal/scheduler"
+	"github.com/fr0der1c/tgtldr/app/internal/store"
+	"github.com/fr0der1c/tgtldr/app/internal/summary"
+	telegramsvc "github.com/fr0der1c/tgtldr/app/internal/telegram"
+	"golang.org/x/sync/errgroup"
+)
+
+func main() {
+	if err := run(); err != nil {
+		panic(err)
+	}
+}
+
+func run() error {
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	cfg, err := config.Load()
+	if err != nil {
+		return fmt.Errorf("load config: %w", err)
+	}
+
+	st, err := store.Open(ctx, cfg)
+	if err != nil {
+		return err
+	}
+	defer st.Close()
+
+	if err := store.RunMigrations(ctx, st); err != nil {
+		return err
+	}
+
+	// A single authorized account can safely be the sole Bot operator by default.
+	_, _ = st.Pool.Exec(ctx, `update activity_config set owner_id=(select min(telegram_user_id) from telegram_accounts where status='authorized' and telegram_user_id>0 having count(*)=1) where id=1 and owner_id=0 and (select count(*) from telegram_accounts where status='authorized' and telegram_user_id>0)=1`)
+	sysClock := clock.System{}
+	botService := bot.New()
+	summaryService := summary.NewService(st, sysClock, cfg.OpenAITimeout)
+	telegramService := telegramsvc.NewService(ctx, st, sysClock, cfg.MediaDir)
+	dailyDigestService := dailydigest.NewService(ctx, st, sysClock, botService, cfg.OpenAITimeout)
+	if err := dailyDigestService.RecoverInterrupted(ctx); err != nil {
+		return fmt.Errorf("recover interrupted daily digest tasks: %w", err)
+	}
+	schedulerService := scheduler.NewService(st, sysClock, summaryService, botService, dailyDigestService)
+	if err := schedulerService.RecoverInterruptedSummaries(ctx); err != nil {
+		return fmt.Errorf("recover interrupted summary tasks: %w", err)
+	}
+	catchUpService := catchup.NewService(ctx, st, sysClock, botService, cfg.OpenAITimeout)
+	if err := catchUpService.RecoverInterrupted(ctx); err != nil {
+		return fmt.Errorf("recover interrupted Catch Up tasks: %w", err)
+	}
+
+	router := api.New(
+		st,
+		telegramService,
+		schedulerService,
+		catchUpService,
+		dailyDigestService,
+		botService,
+		cfg.WebOrigin,
+		cfg.RequestTimout,
+		cfg.MediaDir,
+	)
+
+	if accounts, err := st.Auth.List(ctx); err == nil && config.StorageProtected() {
+		for _, account := range accounts {
+			if account.Status == "authorized" {
+				telegramService.EnsureListener(account.ID)
+			}
+		}
+	}
+
+	server := &http.Server{
+		Addr:    cfg.HTTPAddr,
+		Handler: router.Handler(),
+	}
+
+	group, groupCtx := errgroup.WithContext(ctx)
+	group.Go(func() error {
+		if !config.StorageProtected() {
+			<-groupCtx.Done()
+			return nil
+		}
+		return activity.New(st).PollBot(groupCtx)
+	})
+	group.Go(func() error {
+		if err := activity.New(st).Run(groupCtx); err != nil && !errors.Is(err, context.Canceled) {
+			return err
+		}
+		return nil
+	})
+	group.Go(func() error {
+		if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			return err
+		}
+		return nil
+	})
+	group.Go(func() error {
+		<-groupCtx.Done()
+		telegramService.StopListener()
+		return server.Shutdown(context.Background())
+	})
+
+	return group.Wait()
+}
