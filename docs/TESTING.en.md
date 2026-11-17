@@ -43,4 +43,4 @@ Still untested on real devices: Windows and Intel installations, Docker executio
 
 On the deployment host, `go test -p 1 -count=1 ./...` passed with two isolated, disposable PostgreSQL databases. Coverage includes committing a claim before sending, eight concurrent senders, five scheduler passes after receipt persistence fails, restart recovery, explicit single-message retries, and newer revisions preserving unresolved attempts. Additional checks cover malformed receipts and required retry confirmation. All tests use a simulated Bot and send no real notifications. Continued observation is needed to confirm real phone notification behavior.
 
-The production web build and TypeScript checks passed. The build tool flagged a known security issue in the existing Next.js version; a framework upgrade is recommended separately. This fix does not change the framework version.
+The production web build and TypeScript checks passed. Next.js was upgraded to 16.4.6; `npm audit --omit=dev` reported zero known vulnerabilities, and all seven calendar tests passed.
