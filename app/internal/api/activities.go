@@ -137,6 +137,26 @@ func (r *Router) handleActivityDigests(w http.ResponseWriter, req *http.Request)
 	httpx.JSON(w, 200, map[string]any{"items": items})
 }
 func (r *Router) handleActivityRetry(w http.ResponseWriter, req *http.Request) {
+	var p struct {
+		DeliveryKey       string `json:"deliveryKey"`
+		ConfirmUnreceived bool   `json:"confirmUnreceived"`
+	}
+	if req.ContentLength != 0 && httpx.DecodeJSON(req, &p) != nil {
+		httpx.Error(w, 400, "invalid_request")
+		return
+	}
+	if p.DeliveryKey != "" {
+		if !p.ConfirmUnreceived || len(p.DeliveryKey) > 256 {
+			httpx.Error(w, 400, "confirmation_required")
+			return
+		}
+		if err := activity.New(r.store).RetryDelivery(req.Context(), p.DeliveryKey); err != nil {
+			httpx.Error(w, 409, "delivery_not_retryable")
+			return
+		}
+		httpx.JSON(w, 200, map[string]string{"status": "ok"})
+		return
+	}
 	_, e := r.store.Pool.Exec(req.Context(), `update activity_jobs set attempts=0,next_attempt=now() where error_code<>''`)
 	if e != nil {
 		httpx.Error(w, 500, "retry_error")

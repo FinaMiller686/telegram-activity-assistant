@@ -11,9 +11,8 @@ import (
 	"github.com/jackc/pgx/v5"
 )
 
-// Serialize the whole send, including its receipt, across workers and processes.
-// Telegram has no idempotency key for sendMessage: losing a successful response
-// can still cause a duplicate on retry. Such attempts remain visible as unconfirmed.
+// Claim a send durably before calling Telegram. A lost response or process crash
+// leaves a visible, paused attempt; it must never trigger an automatic resend.
 func (s *Service) sendOnce(ctx context.Context, key, content string, keyboard any, owner int64, token string) error {
 	tx, err := s.Store.Pool.Begin(ctx)
 	if err != nil {
@@ -32,12 +31,12 @@ func (s *Service) sendOnce(ctx context.Context, key, content string, keyboard an
 	if _, err = tx.Exec(ctx, `insert into activity_deliveries(key,content) values($1,$2) on conflict do nothing`, key, trimMessage(content)); err != nil {
 		return err
 	}
-	var stored string
+	var stored, code string
 	var done, ready bool
-	if err = tx.QueryRow(ctx, `select content,sent_at is not null or skipped_at is not null,retry_at<=now() from activity_deliveries where key=$1`, key).Scan(&stored, &done, &ready); err != nil {
+	if err = tx.QueryRow(ctx, `select content,sent_at is not null or skipped_at is not null,retry_at<=now(),last_error_code from activity_deliveries where key=$1`, key).Scan(&stored, &done, &ready, &code); err != nil {
 		return err
 	}
-	if done {
+	if done || deliveryNeedsReview(code) {
 		return tx.Commit(ctx)
 	}
 	if isCard {
@@ -58,12 +57,20 @@ func (s *Service) sendOnce(ctx context.Context, key, content string, keyboard an
 			}
 			return tx.Commit(ctx)
 		}
-		// Only the current revision is retried; never replay an older failed card.
+		// A newer revision cannot overtake a send still in flight or hide an
+		// uncertain earlier attempt. A confirmed receipt releases the next revision.
+		var unresolved bool
+		if err = tx.QueryRow(ctx, `select exists(select 1 from activity_deliveries where key like $1 and sent_at is null and skipped_at is null and last_error_code in ('delivery_sending','delivery_unconfirmed'))`, resource+":%").Scan(&unresolved); err != nil {
+			return err
+		}
+		if unresolved {
+			return tx.Commit(ctx)
+		}
 		if _, err = tx.Exec(ctx, `update activity_deliveries set skipped_at=now(),skip_reason='superseded' where key like $1 and key<>$2 and sent_at is null and skipped_at is null`, resource+":%", key); err != nil {
 			return err
 		}
-		// A revision can change hidden extraction fields without changing the card.
-		// Compare only with the most recent actual send, so A -> B -> A is delivered.
+		// Compare with the latest actual send so a real A -> B -> A update
+		// remains visible, while invisible extraction changes do not resend a card.
 		var previous string
 		err = tx.QueryRow(ctx, `select content from activity_deliveries where key like $1 and sent_at is not null order by sent_at desc,created_at desc,key desc limit 1`, resource+":%").Scan(&previous)
 		if err != nil && err != pgx.ErrNoRows {
@@ -76,10 +83,17 @@ func (s *Service) sendOnce(ctx context.Context, key, content string, keyboard an
 			}
 			return tx.Commit(ctx)
 		}
-
 	}
 	if !ready {
 		return tx.Commit(ctx)
+	}
+	var attempt int
+	if err = tx.QueryRow(ctx, `update activity_deliveries set attempts=attempts+1,last_error_code='delivery_sending',retry_at=now()+interval '2 minutes' where key=$1 returning attempts`, key).Scan(&attempt); err != nil {
+		return err
+	}
+	// No network side effect is allowed unless this claim has committed.
+	if err = tx.Commit(ctx); err != nil {
+		return err
 	}
 	payload := map[string]any{"chat_id": owner, "text": trimMessage(stored), "disable_web_page_preview": true}
 	if keyboard != nil {
@@ -92,22 +106,21 @@ func (s *Service) sendOnce(ctx context.Context, key, content string, keyboard an
 	if err == nil && receipt.MessageID <= 0 {
 		err = fmt.Errorf("bot_response_invalid")
 	}
-	// Persist a receipt even if the caller is cancelled just after Telegram replies.
 	finish, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
 	defer cancel()
 	if err != nil {
-		code := "bot_send_failed"
-		if err.Error() == "bot_network_failed" || err.Error() == "bot_response_invalid" {
-			code = "delivery_unconfirmed"
-		}
-		_, saveErr := tx.Exec(finish, `update activity_deliveries set attempts=attempts+1,last_error_code=$2,retry_at=now()+interval '2 minutes'*least(attempts+1,30) where key=$1`, key, code)
-		if saveErr == nil {
-			saveErr = tx.Commit(finish)
-		}
+		// Only an explicit rejection is safe to retry automatically. Network,
+		// malformed-response and server errors may follow a successful send.
+		_, saveErr := s.Store.Pool.Exec(finish, `update activity_deliveries set last_error_code=$2,retry_at=now()+interval '2 minutes'*least(attempts,30) where key=$1 and attempts=$3 and sent_at is null`, key, deliveryFailureCode(err), attempt)
 		return errors.Join(err, saveErr)
 	}
-	if _, err = tx.Exec(finish, `update activity_deliveries set sent_at=clock_timestamp(),bot_message_id=$2,attempts=attempts+1,last_error_code='' where key=$1`, key, receipt.MessageID); err != nil {
+	tag, err := s.Store.Pool.Exec(finish, `update activity_deliveries set sent_at=clock_timestamp(),bot_message_id=$2,last_error_code='',skipped_at=null,skip_reason='' where key=$1 and attempts=$3 and sent_at is null`, key, receipt.MessageID, attempt)
+	if err != nil {
+		// The durable claim remains paused even when saving the receipt fails.
 		return err
 	}
-	return tx.Commit(finish)
+	if tag.RowsAffected() != 1 {
+		return fmt.Errorf("delivery_receipt_changed")
+	}
+	return nil
 }

@@ -103,7 +103,9 @@ func (s *Service) Call(ctx context.Context, token, method string, payload any, o
 		return fmt.Errorf("bot_api_status_%d", resp.StatusCode)
 	}
 	if out != nil {
-		return json.Unmarshal(envelope.Result, out)
+		if err := json.Unmarshal(envelope.Result, out); err != nil {
+			return fmt.Errorf("bot_response_invalid")
+		}
 	}
 	return nil
 }

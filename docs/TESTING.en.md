@@ -38,3 +38,9 @@ Windows script checks: `powershell -NoProfile -File scripts/windows-tests.ps1`. 
 The calendar suite has seven passing tests. Unit and disposable-database tests passed for the activity, Bot, and API backend packages. Other completed checks include web builds, Linux x64 / ARM64 backend builds, Windows script simulations, and Compose configuration validation. Real text extraction, model processing, private Bot delivery, and `.ics` sending have been checked on an Apple Silicon Mac.
 
 Still untested on real devices: Windows and Intel installations, Docker execution, live message edits/deletions and full sleep recovery, mobile calendar import, and saving drafts in signed-in Google / Outlook accounts. Image recognition is not implemented. Mock tests and successful API receipts do not prove those actions have succeeded.
+
+## Duplicate-delivery fix validation (2026-11-17)
+
+On the deployment host, `go test -p 1 -count=1 ./...` passed with two isolated, disposable PostgreSQL databases. Coverage includes committing a claim before sending, eight concurrent senders, five scheduler passes after receipt persistence fails, restart recovery, explicit single-message retries, and newer revisions preserving unresolved attempts. Additional checks cover malformed receipts and required retry confirmation. All tests use a simulated Bot and send no real notifications. Continued observation is needed to confirm real phone notification behavior.
+
+The production web build and TypeScript checks passed. The build tool flagged a known security issue in the existing Next.js version; a framework upgrade is recommended separately. This fix does not change the framework version.

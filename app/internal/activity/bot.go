@@ -332,12 +332,20 @@ func (s *Service) Deliver(ctx context.Context) error {
 		return errors.Join(failures...)
 	}
 	var retrying bool
-	if e = s.Store.Pool.QueryRow(ctx, `select exists(select 1 from activity_deliveries where sent_at is null and skipped_at is null and last_error_code<>'')`).Scan(&retrying); e != nil {
+	if e = s.Store.Pool.QueryRow(ctx, `select exists(select 1 from activity_deliveries where sent_at is null and skipped_at is null and last_error_code<>'' and last_error_code not in ('delivery_sending','delivery_unconfirmed'))`).Scan(&retrying); e != nil {
 		return e
 	}
 	code := "ok"
 	if retrying {
 		code = "bot_delivery_retrying"
+	} else {
+		var unresolved bool
+		if e = s.Store.Pool.QueryRow(ctx, `select exists(select 1 from activity_deliveries where sent_at is null and skipped_at is null and last_error_code in ('delivery_sending','delivery_unconfirmed'))`).Scan(&unresolved); e != nil {
+			return e
+		}
+		if unresolved {
+			code = "bot_delivery_unconfirmed"
+		}
 	}
 	s.Record(ctx, "delivery", code)
 	return nil

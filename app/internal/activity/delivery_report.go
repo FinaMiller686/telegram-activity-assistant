@@ -78,7 +78,9 @@ func (s *Service) DeliveryReport(ctx context.Context) (DeliveryReport, error) {
 			record.State = "sent"
 		case skipped != nil:
 			record.State = reason
-		case code == "delivery_unconfirmed":
+		case code == "delivery_sending" && record.RetryAt.After(time.Now()):
+			record.State = "sending"
+		case deliveryNeedsReview(code):
 			record.State = "unconfirmed"
 		case attempts > 0:
 			record.State = "retrying"
@@ -90,10 +92,10 @@ func (s *Service) DeliveryReport(ctx context.Context) (DeliveryReport, error) {
 			if record.Kind != "digestpart" {
 				report.PendingDeliveries++
 			}
-			if attempts > 0 {
+			if attempts > 0 && !deliveryNeedsReview(code) {
 				report.RetryingDeliveries++
 			}
-			if code == "delivery_unconfirmed" {
+			if record.State == "unconfirmed" {
 				report.UnconfirmedDeliveries++
 			}
 		}

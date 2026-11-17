@@ -8,10 +8,10 @@ type Event = {id:number; nameEn:string; nameZh:string; organizer:string; summary
 type Config={aiEnabled:boolean;collectSince:string|null;digestTime:string;reminderHours:number;retentionDays:number;ownerId:number};
 type DeliveryRecord={key:string;kind:string;content:string;state:string;sentAt:string|null;createdAt:string;retryAt:string;messageId:number};
 type DeliveryReport={queuedMessages:number;failedJobs:number;exhaustedJobs:number;pendingDeliveries:number;retryingDeliveries:number;unconfirmedDeliveries:number;monitoredGroups:number;staleGroups:number;oldestSync:string|null;botReady:boolean;recent:DeliveryRecord[]};
-const deliveryStates:Record<string,string>={sent:"Telegram 已接收",unchanged:"内容未变，未重复发送",superseded:"已被新版替代",inactive:"已过期或已取消推送",pending:"待发送",retrying:"发送失败，等待重试",unconfirmed:"发送结果未确认，将重试"};
+const deliveryStates:Record<string,string>={sent:"Telegram 已接收",unchanged:"内容未变，未重复发送",superseded:"已被新版替代",inactive:"已过期或已取消推送",pending:"待发送",retrying:"发送失败，等待重试",sending:"正在发送",unconfirmed:"发送结果未确认，已暂停自动重发"};
 const deliveryKinds:Record<string,string>={card:"活动卡片",deadline:"截止提醒",digest:"每日摘要",digestpart:"摘要片段"};
 const runtimeNames:Record<string,string>={worker:"处理任务",ai:"AI 处理",history:"历史回补",delivery:"Bot 投递",bot:"Bot 交互",source_audit:"来源核对",extraction:"信息提取"};
-const runtimeCodes:Record<string,string>={ok:"正常",storage_encryption_required:"等待加密存储",database_or_processing_error:"数据库或处理错误",bot_delivery_failed:"Bot 投递失败，将重试",bot_delivery_retrying:"部分推送等待重试",model_request_failed:"模型请求失败",calendar_delivery_failed:"日历文件发送失败，请稍后重试。",poll_failed_check_token_or_webhook:"Bot 接收失败，请检查 Token 或 webhook",gap_exceeds_30_days_manual_backfill_required:"间隔超过 30 天，需要手动回补",backfill_start_failed:"回补启动失败",backfill_failed:"回补失败",telegram_request_failed:"Telegram 请求失败",database_error:"数据库错误",unexpected_response:"Telegram 响应异常",store_failed:"保存失败"};
+const runtimeCodes:Record<string,string>={ok:"正常",storage_encryption_required:"等待加密存储",database_or_processing_error:"数据库或处理错误",bot_delivery_failed:"部分推送未完成，请查看推送记录",bot_delivery_retrying:"部分推送等待重试",bot_delivery_unconfirmed:"部分推送结果未确认，已暂停自动重发",model_request_failed:"模型请求失败",calendar_delivery_failed:"日历文件发送失败，请稍后重试。",poll_failed_check_token_or_webhook:"Bot 接收失败，请检查 Token 或 webhook",gap_exceeds_30_days_manual_backfill_required:"间隔超过 30 天，需要手动回补",backfill_start_failed:"回补启动失败",backfill_failed:"回补失败",telegram_request_failed:"Telegram 请求失败",database_error:"数据库错误",unexpected_response:"Telegram 响应异常",store_failed:"保存失败"};
 const categories=["校园活动","学术讲座","金融与商业活动","职业发展与实习","比赛与工作坊","学生福利","其他重要通知"];
 const statuses:Record<string,string>={new:"新活动",going:"我要参加",later:"稍后决定",ignored:"不感兴趣",registered:"已完成报名",attended:"已参加"};
 async function call<T>(path:string,method="GET",body?:unknown):Promise<T>{const r=await fetch(path,{method,credentials:"include",headers:{"Content-Type":"application/json"},body:body===undefined?undefined:JSON.stringify(body)});if(r.status===401){window.location.href="/login";throw Error("请先登录")}if(!r.ok){throw Error("操作未完成，请检查配置与系统状态。")}return r.json()}
@@ -70,7 +70,8 @@ export function ActivitiesPanel(){
  <p>统计只覆盖已保存的文字；纯图片通知暂不识别，AI 也可能漏判。已接收表示 Telegram 确认收到了推送，不代表手机已读。</p>
  {delivery.recent.map(d=><details key={d.key}><summary>{deliveryKinds[d.kind]||d.kind} · {deliveryStates[d.state]||d.state} · {d.content.split("\n")[0].slice(0,80)}</summary>
  <p>{when(d.sentAt||d.createdAt)}{d.messageId>0&&<span> · Telegram #{d.messageId}</span>}</p>
- {(d.state==="retrying"||d.state==="unconfirmed")&&<p><span>下次重试：</span>{when(d.retryAt)}</p>}
+ {d.state==="retrying"&&<p><span>下次重试：</span>{when(d.retryAt)}</p>}
+ {d.state==="unconfirmed"&&<><p>请先检查 Telegram。确认没有收到后，可重试这一条；如果其实已经送达，重试仍可能产生重复。</p><Button disabled={busy||new Date(d.retryAt).getTime()>Date.now()} onClick={()=>void run(()=>call("/api/activity/retry","POST",{deliveryKey:d.key,confirmUnreceived:true}))}>确认未收到，重试此条</Button></>}
  <pre style={{whiteSpace:"pre-wrap"}}>{d.content}</pre></details>)}</>}
  </Surface>
  <Surface title="系统状态"><Button disabled={busy} onClick={()=>void run(()=>call("/api/activity/retry","POST",{}))}>重试失败提取</Button>{logs.map(l=><p key={l.name}>{runtimeNames[l.name]||l.name} · {runtimeCodes[l.code]||l.code} · {when(l.updatedAt)}</p>)}</Surface>

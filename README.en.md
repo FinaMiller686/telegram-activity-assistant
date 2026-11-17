@@ -10,6 +10,7 @@ The app runs on your computer. macOS uses a native launcher; Windows uses Docker
 
 - Choose which groups and channels to follow. Extract event times, venues, descriptions, and registration deadlines.
 - Combine reposts of the same event, keep source links, and flag time conflicts.
+- Pause automatic resending when delivery is uncertain. After checking Telegram, retry an individual message from delivery history.
 - Browse upcoming events and manage your choices in the web interface or Bot.
 - Receive a daily digest at 21:00 Singapore time and reminders before registration closes.
 - Export `.ics` files for Apple Calendar, Google Calendar, and Outlook, or open a Google / Outlook draft and save it yourself.

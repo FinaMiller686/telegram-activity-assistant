@@ -11,10 +11,11 @@ import (
 )
 
 type receiptBot struct {
-	mu       sync.Mutex
-	texts    []string
-	failText string
-	failure  string
+	mu         sync.Mutex
+	texts      []string
+	failText   string
+	failure    string
+	beforeSend func() error
 }
 
 func (f *receiptBot) Call(_ context.Context, _, method string, payload any, out any) error {
@@ -24,6 +25,11 @@ func (f *receiptBot) Call(_ context.Context, _, method string, payload any, out 
 		return fmt.Errorf("unexpected_method")
 	}
 	text := payload.(map[string]any)["text"].(string)
+	if f.beforeSend != nil {
+		if err := f.beforeSend(); err != nil {
+			return err
+		}
+	}
 	if f.failText != "" && strings.Contains(text, f.failText) {
 		return fmt.Errorf("%s", f.failure)
 	}
@@ -248,6 +254,19 @@ func TestUnconfirmedSendAndSnapshotRemainVisible(t *testing.T) {
 	if err = s.sendOnce(ctx, "probe:snapshot", "Changed during retry", nil, 7001, "fixture-token"); err != nil {
 		t.Fatal(err)
 	}
+	if len(fake.texts) != 0 {
+		t.Fatal("uncertain send retried automatically after backoff")
+	}
+	report, err = s.DeliveryReport(ctx)
+	if err != nil || report.UnconfirmedDeliveries != 1 || report.RetryingDeliveries != 0 {
+		t.Fatalf("paused send incorrectly reported as automatic retry: %+v %v", report, err)
+	}
+	if err = s.RetryDelivery(ctx, "probe:snapshot"); err != nil {
+		t.Fatal(err)
+	}
+	if err = s.sendOnce(ctx, "probe:snapshot", "Changed during retry", nil, 7001, "fixture-token"); err != nil {
+		t.Fatal(err)
+	}
 	if len(fake.texts) != 1 || fake.texts[0] != "Stored snapshot" {
 		t.Fatal("retry replaced persisted snapshot")
 	}
@@ -309,5 +328,127 @@ func TestDuplicateSuppressionIsScopedToOneActivity(t *testing.T) {
 	sendFixtureCard(t, s, other)
 	if len(fake.texts) != 2 {
 		t.Fatal("different activity hidden by global text matching")
+	}
+}
+
+func TestDeliveryClaimCommitsBeforeNetworkCall(t *testing.T) {
+	s, fake, _ := deliveryFixture(t)
+	ctx := context.Background()
+	fake.beforeSend = func() error {
+		var code string
+		var attempts int
+		if err := s.Store.Pool.QueryRow(ctx, `select last_error_code,attempts from activity_deliveries where key='probe:durable'`).Scan(&code, &attempts); err != nil {
+			return err
+		}
+		if code != "delivery_sending" || attempts != 1 {
+			return fmt.Errorf("network call preceded durable claim: %q %d", code, attempts)
+		}
+		return nil
+	}
+	if err := s.sendOnce(ctx, "probe:durable", "Durable fixture", nil, 7001, "fixture-token"); err != nil {
+		t.Fatal(err)
+	}
+	if len(fake.texts) != 1 {
+		t.Fatal("fixture was not delivered")
+	}
+}
+
+func TestLostReceiptNeverResendsAutomatically(t *testing.T) {
+	s, fake, _ := deliveryFixture(t)
+	ctx := context.Background()
+	// Simulate Telegram accepting the message while persisting its receipt fails.
+	if _, err := s.Store.Pool.Exec(ctx, `
+		create function fixture_reject_delivery_receipt() returns trigger language plpgsql as $$
+		begin
+			if new.key='probe:receipt-lost' and new.sent_at is not null then
+				raise exception 'synthetic receipt failure';
+			end if;
+			return new;
+		end $$;
+		create trigger fixture_delivery_receipt before update on activity_deliveries
+		for each row execute function fixture_reject_delivery_receipt();
+	`); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_, _ = s.Store.Pool.Exec(ctx, `drop trigger if exists fixture_delivery_receipt on activity_deliveries; drop function if exists fixture_reject_delivery_receipt();`)
+	})
+	if err := s.sendOnce(ctx, "probe:receipt-lost", "Accepted fixture", nil, 7001, "fixture-token"); err == nil {
+		t.Fatal("receipt persistence failure concealed")
+	}
+	if len(fake.texts) != 1 {
+		t.Fatal("Telegram fixture did not accept the first send")
+	}
+	if _, err := s.Store.Pool.Exec(ctx, `update activity_deliveries set retry_at=now()-interval '1 minute' where key='probe:receipt-lost'`); err != nil {
+		t.Fatal(err)
+	}
+	restarted := New(s.Store)
+	restarted.bot = fake
+	for range 5 {
+		if err := restarted.sendOnce(ctx, "probe:receipt-lost", "Accepted fixture", nil, 7001, "fixture-token"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if len(fake.texts) != 1 {
+		t.Fatal("lost receipt replayed an already accepted message")
+	}
+	report, err := s.DeliveryReport(ctx)
+	if err != nil || report.UnconfirmedDeliveries != 1 || report.RetryingDeliveries != 0 {
+		t.Fatalf("lost receipt not visible as paused: %+v %v", report, err)
+	}
+}
+
+func TestExplicitRetryCannotReopenAnInFlightSend(t *testing.T) {
+	s, fake, _ := deliveryFixture(t)
+	ctx := context.Background()
+	fake.beforeSend = func() error {
+		if err := s.RetryDelivery(ctx, "probe:in-flight"); err == nil {
+			return fmt.Errorf("manual retry reopened an active send")
+		}
+		return nil
+	}
+	if err := s.sendOnce(ctx, "probe:in-flight", "In-flight fixture", nil, 7001, "fixture-token"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.RetryDelivery(ctx, "probe:in-flight"); err == nil {
+		t.Fatal("manual retry reopened a confirmed send")
+	}
+}
+
+func TestNewRevisionDoesNotHideAnUnconfirmedSend(t *testing.T) {
+	s, fake, chat := deliveryFixture(t)
+	ctx := context.Background()
+	d := Details{NameEN: "Uncertain revision fixture", Date: "2099-01-01"}
+	id, err := s.Save(ctx, chat, 1, "", &d)
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldKey := fmt.Sprintf("card:%d:1", id)
+	fake.failText, fake.failure = d.NameEN, "bot_network_failed"
+	if err = s.sendOnce(ctx, oldKey, Card(Event{Details: d}), nil, 7001, "fixture-token"); err == nil {
+		t.Fatal("uncertain failure concealed")
+	}
+	d.Summary = "New revision"
+	if _, err = s.Save(ctx, chat, 1, "", &d); err != nil {
+		t.Fatal(err)
+	}
+	fake.failText = ""
+	sendFixtureCard(t, s, id)
+	var unresolved bool
+	if err = s.Store.Pool.QueryRow(ctx, `select skipped_at is null and last_error_code='delivery_unconfirmed' from activity_deliveries where key=$1`, oldKey).Scan(&unresolved); err != nil {
+		t.Fatal(err)
+	}
+	if !unresolved || len(fake.texts) != 0 {
+		t.Fatal("new revision hid or bypassed an uncertain earlier attempt")
+	}
+	if _, err = s.Store.Pool.Exec(ctx, `update activity_deliveries set retry_at=now()-interval '1 minute' where key=$1`, oldKey); err != nil {
+		t.Fatal(err)
+	}
+	if err = s.RetryDelivery(ctx, oldKey); err != nil {
+		t.Fatal(err)
+	}
+	sendFixtureCard(t, s, id)
+	if len(fake.texts) != 1 || !strings.Contains(fake.texts[0], "New revision") {
+		t.Fatal("explicit retry did not release the latest revision")
 	}
 }
